@@ -36,22 +36,26 @@ SUPPORT_MESSAGE: Final[str] = (
 
 SUPPORT_BUTTON_TEXT: Final[str] = "✉️ Написать в поддержку"
 PERSONAL_AREA_BUTTON_TEXT: Final[str] = "🧑‍💼 Личный кабинет"
+
+PERSONAL_AREA_COMMAND: Final[str] = "cab"
 PERSONAL_AREA_CALLBACK_DATA: Final[str] = "personal-area-open"
 PERSONAL_AREA_EDIT_NAME_CALLBACK: Final[str] = "personal-area-edit-name"
 PERSONAL_AREA_EDIT_AGE_CALLBACK: Final[str] = "personal-area-edit-age"
 PERSONAL_AREA_BACK_CALLBACK: Final[str] = "personal-area-back"
+PERSONAL_AREA_CLOSE_CALLBACK: Final[str] = "personal-area-close"
 
-PROFILE_KEY: Final[str] = "personal_area_profile"
-AWAITING_INPUT_KEY: Final[str] = "personal_area_awaiting"
+PERSONAL_AREA_PROFILE_KEY: Final[str] = "personal_area_profile"
+PERSONAL_AREA_AWAITING_INPUT_KEY: Final[str] = "personal_area_awaiting"
+PERSONAL_AREA_MESSAGE_KEY: Final[str] = "personal_area_message"
 
-DEFAULT_COMMANDS: Final[tuple[BotCommand, ...]] = (
+BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand("support", "Написать в поддержку"),
-    BotCommand("cab", "Личный кабинет"),
+    BotCommand(PERSONAL_AREA_COMMAND, "Личный кабинет"),
 )
 
 
 def _support_url() -> str:
-    """Return the URL to open when the user presses the support button."""
+    """Return the support chat URL for the inline button."""
     url = os.getenv("SUPPORT_CHAT_URL")
     if not url:
         LOGGER.warning(
@@ -61,8 +65,19 @@ def _support_url() -> str:
     return url
 
 
+def _support_keyboard() -> InlineKeyboardMarkup:
+    """Assemble the inline keyboard for the support helper message."""
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(SUPPORT_BUTTON_TEXT, url=_support_url())],
+            [InlineKeyboardButton(PERSONAL_AREA_BUTTON_TEXT, callback_data=PERSONAL_AREA_CALLBACK_DATA)],
+        ]
+    )
+
+
 def _consultation_url() -> str:
-    """Return the URL that leads to the consultation booking flow."""
+    """Return the consultation URL for booking a meeting with the team."""
     url = os.getenv("CONSULTATION_URL")
     if not url:
         LOGGER.warning(
@@ -73,16 +88,17 @@ def _consultation_url() -> str:
 
 
 def _format_number(value: int) -> str:
-    """Format numbers with thousands separators for readability."""
+    """Format integers with a thin space as a thousands separator."""
     return f"{value:,}".replace(",", " ")
 
 
 def _generate_referral_code(user_id: int) -> str:
-    """Create a deterministic short referral code based on the user identifier."""
+    """Generate a deterministic referral code based on the Telegram user id."""
     alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    base = len(alphabet)
     if user_id <= 0:
         user_id = abs(user_id) + 1
-    base = len(alphabet)
+
     code = ""
     while user_id:
         user_id, remainder = divmod(user_id, base)
@@ -90,19 +106,20 @@ def _generate_referral_code(user_id: int) -> str:
     return code or "0"
 
 
-async def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Resolve the bot username, falling back to a placeholder if needed."""
+async def _resolve_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Return the bot username by querying Telegram when required."""
     username = context.bot.username
     if username:
         return username
+
     bot = await context.bot.get_me()
     return bot.username or os.getenv("BOT_USERNAME", "your_bot")
 
 
 def _ensure_profile(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
-    """Return stored profile data, creating defaults when required."""
+    """Fetch personal area data for the user, creating defaults when necessary."""
     profile = context.user_data.setdefault(
-        PROFILE_KEY,
+        PERSONAL_AREA_PROFILE_KEY,
         {
             "name": None,
             "age": None,
@@ -114,15 +131,30 @@ def _ensure_profile(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
             "ref_code": None,
         },
     )
+
     if not profile.get("ref_code"):
         profile["ref_code"] = _generate_referral_code(user_id)
+
     return profile
 
 
-async def _personal_area_text(
+def _remember_personal_area_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    """Store the latest personal area message identifiers for later updates."""
+
+    if message is None:
+        return
+
+    context.user_data[PERSONAL_AREA_MESSAGE_KEY] = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+    }
+
+
+async def _personal_area_payload(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Construct the personal area message text and keyboard."""
+    """Build personal area text and inline keyboard based on stored profile."""
+
     user = update.effective_user
     if user is None:
         raise RuntimeError("Personal area requested without an effective user")
@@ -132,12 +164,13 @@ async def _personal_area_text(
     gender = profile.get("gender") or "не указано"
     age = profile.get("age") or "не указано"
     free_tokens = profile.get("free_tokens", 0)
-    free_tokens_limit = profile.get("free_tokens_limit", 50_000)
+    free_limit = profile.get("free_tokens_limit", 50_000)
     paid_tokens = profile.get("paid_tokens", 0)
     subscription = profile.get("subscription", 0)
-    referral_code = profile.get("ref_code") or _generate_referral_code(user.id)
-    username = await _bot_username(context)
-    referral_link = f"https://t.me/{username}?start={referral_code}"
+    ref_code = profile.get("ref_code") or _generate_referral_code(user.id)
+
+    username = await _resolve_bot_username(context)
+    referral_link = f"https://t.me/{username}?start={ref_code}"
 
     text = (
         "🧑‍💼 *Личный кабинет*\n\n"
@@ -147,7 +180,7 @@ async def _personal_area_text(
         f"Пол: {gender}\n"
         f"Возраст: {age}\n\n"
         "🎁 *Баланс токенов:*\n"
-        f"   Бесплатных: {_format_number(free_tokens)} из {_format_number(free_tokens_limit)}\n"
+        f"   Бесплатных: {_format_number(free_tokens)} из {_format_number(free_limit)}\n"
         f"   Платных: {_format_number(paid_tokens)}\n\n"
         f"📨 Подписка: {subscription}\n\n"
         "🔗 *Твоя ссылка для приглашений:*\n"
@@ -174,238 +207,243 @@ async def _personal_area_text(
                     "🗓 Записаться на консультацию", url=_consultation_url()
                 )
             ],
+            [InlineKeyboardButton("🔙 Закрыть", callback_data=PERSONAL_AREA_CLOSE_CALLBACK)],
         ]
     )
 
     return text, keyboard
 
 
+async def _refresh_personal_area_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Update the stored personal area message with fresh profile data."""
+
+    target = context.user_data.get(PERSONAL_AREA_MESSAGE_KEY)
+    if not target:
+        return
+
+    text, keyboard = await _personal_area_payload(update, context)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=target["chat_id"],
+            message_id=target["message_id"],
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:  # pragma: no cover - network failure is not critical
+        LOGGER.warning("Failed to refresh personal area message: %s", exc)
+
+
+async def _show_personal_area(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    new_message: bool,
+) -> None:
+    """Render the personal area either as a new message or by editing the current one."""
+
+    text, keyboard = await _personal_area_payload(update, context)
+
+    if update.callback_query is not None:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        _remember_personal_area_message(context, query.message)
+        return
+
+    message = update.effective_message
+    if message is None:
+        LOGGER.debug("No message to display personal area")
+        return
+
+    if new_message:
+        sent = await message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        _remember_personal_area_message(context, sent)
+    else:
+        await message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        _remember_personal_area_message(context, message)
+
+
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send the support helper message along with inline buttons."""
+    """Handle the /support command by showing helper text and inline buttons."""
     message = update.effective_message
     if message is None:
         LOGGER.debug("No message to reply to for /support command")
         return
 
-    keyboard = [
-        [InlineKeyboardButton(SUPPORT_BUTTON_TEXT, url=_support_url())],
-        [InlineKeyboardButton(PERSONAL_AREA_BUTTON_TEXT, callback_data=PERSONAL_AREA_CALLBACK_DATA)],
-    ]
-
     await message.reply_text(
         SUPPORT_MESSAGE,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=_support_keyboard(),
     )
 
 
-async def _remember_personal_area_message(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int
-) -> None:
-    """Persist the last personal area message identifiers for later updates."""
-    context.user_data["personal_area_message"] = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-    }
+async def personal_area_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for the /cab command."""
+    await _show_personal_area(update, context, new_message=True)
 
 
-async def show_personal_area(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Render the personal area either in response to a command or a callback."""
-    text, keyboard = await _personal_area_text(update, context)
-
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        if query.message is None:
-            return
-        await query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await _remember_personal_area_message(
-            context, query.message.chat_id, query.message.message_id
-        )
-        return
-
-    message = update.effective_message
-    if message is None:
-        LOGGER.debug("No message found for personal area rendering")
-        return
-
-    sent = await message.reply_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await _remember_personal_area_message(context, sent.chat_id, sent.message_id)
-
-
-async def _delete_personal_area_reference(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forget stored information about the personal area message."""
-    context.user_data.pop("personal_area_message", None)
+async def personal_area_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button presses that request the personal area."""
+    await _show_personal_area(update, context, new_message=False)
 
 
 async def personal_area_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the back button by deleting the personal area message."""
-    if update.callback_query is None or update.callback_query.message is None:
-        return
+    """Return the user back to the support helper message."""
 
     query = update.callback_query
+    if query is None:
+        return
+
     await query.answer()
-
-    try:
-        await query.message.delete()
-    except TelegramError as error:
-        LOGGER.warning("Failed to delete personal area message: %s", error)
-
-    await _delete_personal_area_reference(context)
+    context.user_data.pop(PERSONAL_AREA_MESSAGE_KEY, None)
+    await query.edit_message_text(
+        SUPPORT_MESSAGE,
+        reply_markup=_support_keyboard(),
+    )
 
 
-async def _prompt_for_input(
+async def personal_area_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove the personal area panel by replacing it with a short notification."""
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer("Панель закрыта")
+    context.user_data.pop(PERSONAL_AREA_MESSAGE_KEY, None)
+    await query.edit_message_text("Панель личного кабинета закрыта.")
+
+
+async def _ask_for_value(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    *,
     field: str,
-    prompt_text: str,
+    prompt: str,
 ) -> None:
-    """Prepare to receive user input for profile editing."""
+    """Request the user to enter a value for one of the editable fields."""
+
     query = update.callback_query
-    if query is None or query.message is None:
+    if query is None:
         return
 
+    context.user_data[PERSONAL_AREA_AWAITING_INPUT_KEY] = field
     await query.answer()
-
-    context.user_data[AWAITING_INPUT_KEY] = {
-        "field": field,
-        "chat_id": query.message.chat_id,
-        "message_id": query.message.message_id,
-    }
-
-    await query.message.reply_text(prompt_text)
+    await query.edit_message_text(
+        prompt,
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
-async def personal_area_edit_name(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Ask the user for a new name value."""
-    await _prompt_for_input(
+async def personal_area_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the flow into name editing mode."""
+    await _ask_for_value(
         update,
         context,
         field="name",
-        prompt_text="Введите новое имя:",
+        prompt=(
+            "✏️ *Изменение имени*\n\n"
+            "Отправьте новое имя одним сообщением.\n"
+            "Чтобы отменить, отправьте /cab."
+        ),
     )
 
 
-async def personal_area_edit_age(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Ask the user for a new age value."""
-    await _prompt_for_input(
+async def personal_area_edit_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the flow into age editing mode."""
+    await _ask_for_value(
         update,
         context,
         field="age",
-        prompt_text="Введите ваш возраст (числом):",
+        prompt=(
+            "🎂 *Изменение возраста*\n\n"
+            "Отправьте возраст числом.\n"
+            "Чтобы отменить, отправьте /cab."
+        ),
     )
 
 
-async def _refresh_personal_area_message(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    message_id: int,
-    update: Update,
-) -> None:
-    """Re-render the personal area message after a profile change."""
-    try:
-        text, keyboard = await _personal_area_text(update, context)
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except TelegramError as error:
-        LOGGER.warning("Failed to refresh personal area message: %s", error)
-
-
-async def personal_area_text_input(
+async def personal_area_handle_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Process user input when editing profile fields."""
-    awaiting = context.user_data.get(AWAITING_INPUT_KEY)
+    """Process textual responses for the personal area edit flows."""
+
+    awaiting = context.user_data.get(PERSONAL_AREA_AWAITING_INPUT_KEY)
     if not awaiting:
         return
 
     message = update.effective_message
-    user = update.effective_user
-    if message is None or user is None:
+    if message is None or message.text is None:
         return
 
-    text_value = message.text.strip()
-    field = awaiting.get("field")
-    profile = _ensure_profile(context, user.id)
+    profile = _ensure_profile(context, update.effective_user.id if update.effective_user else 0)
 
-    if field == "name":
-        profile["name"] = text_value
-        confirmation = f"Имя обновлено на «{text_value}»."
-    elif field == "age":
-        digits = "".join(filter(str.isdigit, text_value))
-        if not digits:
-            await message.reply_text("Пожалуйста, введите возраст числом.")
-            return
-        profile["age"] = digits
-        confirmation = f"Возраст обновлен на {digits}."
-    else:
-        confirmation = "Изменений не внесено."
+    if awaiting == "name":
+        profile["name"] = message.text.strip()
+    elif awaiting == "age":
+        digits = ''.join(ch for ch in message.text if ch.isdigit())
+        profile["age"] = digits or message.text.strip()
 
-    await message.reply_text(confirmation)
-    context.user_data.pop(AWAITING_INPUT_KEY, None)
+    context.user_data.pop(PERSONAL_AREA_AWAITING_INPUT_KEY, None)
 
-    target = context.user_data.get("personal_area_message")
-    if not target:
-        return
-
-    await _refresh_personal_area_message(
-        context,
-        chat_id=target["chat_id"],
-        message_id=target["message_id"],
-        update=update,
-    )
+    await message.reply_text("Данные обновлены ✅")
+    await _refresh_personal_area_message(update, context)
 
 
-async def _configure_bot_commands(application: Application) -> None:
-    """Expose key bot commands and ensure they show up in the menu."""
+async def _update_bot_commands(application: Application) -> None:
+    """Synchronise bot commands and ensure the menu button lists them."""
 
-    await application.bot.set_my_commands(list(DEFAULT_COMMANDS))
-    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    try:
+        await application.bot.set_my_commands(list(BOT_COMMANDS))
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except TelegramError as exc:  # pragma: no cover - network failure is not critical
+        LOGGER.warning("Unable to configure bot commands: %s", exc)
 
 
 def build_application(token: str) -> Application:
-    """Create a telegram application instance with the /support command."""
+    """Create a telegram application instance with the /support and /cab commands."""
     application = Application.builder().token(token).build()
 
-    application.post_init = _configure_bot_commands
-
     application.add_handler(CommandHandler("support", support))
-    application.add_handler(CommandHandler("cab", show_personal_area))
+    application.add_handler(CommandHandler(PERSONAL_AREA_COMMAND, personal_area_command))
     application.add_handler(
-        CallbackQueryHandler(show_personal_area, pattern=f"^{PERSONAL_AREA_CALLBACK_DATA}$")
+        CallbackQueryHandler(personal_area_callback, pattern=f"^{PERSONAL_AREA_CALLBACK_DATA}$")
     )
     application.add_handler(
         CallbackQueryHandler(personal_area_back, pattern=f"^{PERSONAL_AREA_BACK_CALLBACK}$")
     )
     application.add_handler(
-        CallbackQueryHandler(
-            personal_area_edit_name, pattern=f"^{PERSONAL_AREA_EDIT_NAME_CALLBACK}$"
-        )
+        CallbackQueryHandler(personal_area_edit_name, pattern=f"^{PERSONAL_AREA_EDIT_NAME_CALLBACK}$")
     )
     application.add_handler(
-        CallbackQueryHandler(
-            personal_area_edit_age, pattern=f"^{PERSONAL_AREA_EDIT_AGE_CALLBACK}$"
-        )
+        CallbackQueryHandler(personal_area_edit_age, pattern=f"^{PERSONAL_AREA_EDIT_AGE_CALLBACK}$")
     )
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, personal_area_text_input)
+        CallbackQueryHandler(personal_area_close, pattern=f"^{PERSONAL_AREA_CLOSE_CALLBACK}$")
     )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, personal_area_handle_input)
+    )
+
+    application.post_init.append(_update_bot_commands)
 
     return application
 
