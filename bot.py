@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Final
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -197,6 +197,32 @@ async def _remember_personal_area_message(
     }
 
 
+async def _send_personal_area_message(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+    reply_to: Message | None = None,
+) -> None:
+    """Send a new personal area message and remember it for future updates."""
+
+    if reply_to is not None:
+        sent = await reply_to.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    await _remember_personal_area_message(context, sent.chat_id, sent.message_id)
+
+
 async def show_personal_area(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Render the personal area either in response to a command or a callback."""
     text, keyboard = await _personal_area_text(update, context)
@@ -206,14 +232,28 @@ async def show_personal_area(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer()
         if query.message is None:
             return
-        await query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await _remember_personal_area_message(
-            context, query.message.chat_id, query.message.message_id
-        )
+
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await _remember_personal_area_message(
+                context, query.message.chat_id, query.message.message_id
+            )
+        except TelegramError as error:
+            LOGGER.warning(
+                "Failed to edit personal area message in-place: %s. Sending a new one.",
+                error,
+            )
+            await _send_personal_area_message(
+                context=context,
+                chat_id=query.message.chat_id,
+                text=text,
+                keyboard=keyboard,
+                reply_to=query.message,
+            )
         return
 
     message = update.effective_message
@@ -221,12 +261,13 @@ async def show_personal_area(update: Update, context: ContextTypes.DEFAULT_TYPE)
         LOGGER.debug("No message found for personal area rendering")
         return
 
-    sent = await message.reply_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode=ParseMode.MARKDOWN,
+    await _send_personal_area_message(
+        context=context,
+        chat_id=message.chat_id,
+        text=text,
+        keyboard=keyboard,
+        reply_to=message,
     )
-    await _remember_personal_area_message(context, sent.chat_id, sent.message_id)
 
 
 async def _delete_personal_area_reference(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -313,7 +354,23 @@ async def _refresh_personal_area_message(
             parse_mode=ParseMode.MARKDOWN,
         )
     except TelegramError as error:
-        LOGGER.warning("Failed to refresh personal area message: %s", error)
+        LOGGER.warning(
+            "Failed to refresh personal area message: %s. Sending a new copy.",
+            error,
+        )
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError as delete_error:
+            LOGGER.debug(
+                "Unable to delete outdated personal area message: %s",
+                delete_error,
+            )
+        await _send_personal_area_message(
+            context=context,
+            chat_id=chat_id,
+            text=text,
+            keyboard=keyboard,
+        )
 
 
 async def personal_area_text_input(
