@@ -5,7 +5,13 @@ import logging
 import os
 from typing import Final
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -37,6 +43,11 @@ PERSONAL_AREA_BACK_CALLBACK: Final[str] = "personal-area-back"
 
 PROFILE_KEY: Final[str] = "personal_area_profile"
 AWAITING_INPUT_KEY: Final[str] = "personal_area_awaiting"
+
+DEFAULT_COMMANDS: Final[tuple[BotCommand, ...]] = (
+    BotCommand("support", "Написать в поддержку"),
+    BotCommand("cab", "Личный кабинет"),
+)
 
 
 def _support_url() -> str:
@@ -362,14 +373,10 @@ async def personal_area_text_input(
 
 
 async def _configure_bot_commands(application: Application) -> None:
-    """Expose key bot commands in the Telegram menu."""
+    """Expose key bot commands and ensure they show up in the menu."""
 
-    await application.bot.set_my_commands(
-        [
-            BotCommand("support", "Написать в поддержку"),
-            BotCommand("cab", "Личный кабинет"),
-        ]
-    )
+    await application.bot.set_my_commands(list(DEFAULT_COMMANDS))
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
 def build_application(token: str) -> Application:
