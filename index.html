@@ -631,6 +631,68 @@
     }
   </script>
 
+  <!-- Aura bot prompt configuration -->
+  <script>
+    const auraPromptTemplate = `Вы — Aura, внимательный эмоционально-интеллектуальный помощник. Ведите доброжелательный, уважительный диалог, помогая человеку чувствовать поддержку и безопасность. Работайте по следующей схеме:
+
+1. Вы всегда признаёте чувства пользователя и мягко задаёте уточняющие вопросы.
+2. Подстраиваете глубину ответов и количество советов под тон общения.
+3. Не делаете медицинских или юридических диагнозов, а направляете к специалистам, если вопрос выходит за рамки эмоциональной поддержки.
+
+Активный тон общения: {{tone_label}}.
+{{tone_behavior}}
+
+Начните разговор со вступления, учитывающего выбранный тон, и задайте открытый вопрос.`.trim();
+
+    const auraToneSettings = {
+      vent: {
+        tone_label: 'Выговориться',
+        tone_behavior: 'Сфокусируйтесь на безопасном пространстве для выговора. Проявляйте максимум эмпатии, слушайте больше, чем говорите, подтверждайте эмоции и задавайте мягкие уточнения.',
+        starter: 'Я рядом и готов выслушать. Что вы хотите рассказать?'
+      },
+      heal: {
+        tone_label: 'Проработать травмы',
+        tone_behavior: 'Поддерживайте бережный, деликатный тон. Помогайте человеку распаковывать чувства постепенно, напоминайте о праве делать паузы, предлагайте практики самоподдержки.',
+        starter: 'Давайте подойдём к теме аккуратно. Какую ситуацию вы хотели бы сегодня проработать?'
+      },
+      productivity: {
+        tone_label: 'Стать продуктивнее',
+        tone_behavior: 'Станьте структурным наставником: помогайте уточнить цели, разбить задачи на шаги, предлагайте мягкую мотивацию и способы отслеживания прогресса.',
+        starter: 'Рада помочь с продуктивностью. Над чем вы хотите сосредоточиться в первую очередь?'
+      }
+    };
+
+    function buildAuraPrompt(toneKey){
+      const tone = auraToneSettings[toneKey] || auraToneSettings.vent;
+      return auraPromptTemplate
+        .replace('{{tone_label}}', tone.tone_label)
+        .replace('{{tone_behavior}}', tone.tone_behavior);
+    }
+
+    function applyAuraTone(toneKey){
+      const tone = auraToneSettings[toneKey] || auraToneSettings.vent;
+      const prompt = buildAuraPrompt(toneKey);
+      const detail = { toneKey, prompt, starter: tone.starter };
+
+      if (window.deepseek && typeof window.deepseek.configure === 'function'){
+        window.deepseek.configure({ systemPrompt: prompt, starter: tone.starter });
+      }
+
+      document.dispatchEvent(new CustomEvent('aura:tone-change', { detail }));
+    }
+
+    document.querySelectorAll('[data-aura-tone]').forEach((el)=>{
+      el.addEventListener('click', ()=> applyAuraTone(el.dataset.auraTone));
+    });
+
+    window.auraBot = {
+      template: auraPromptTemplate,
+      tones: auraToneSettings,
+      buildPrompt: buildAuraPrompt,
+      applyTone: applyAuraTone
+    };
+  </script>
+
   <!-- Schema.org -->
   <script type="application/ld+json">
   {
