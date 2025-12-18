@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import json
 import logging
 import os
+import sqlite3
+import urllib.parse
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Final, List
+from typing import Any, Dict, Final, List, Optional
 
+from aiogram.types import BufferedInputFile
+from dotenv import load_dotenv
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -22,6 +29,21 @@ from telegram.ext import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+VEDICASTRO_API_KEY = (os.getenv("VEDICASTRO_API_KEY") or "").strip()
+
+VEDIC_CHART_IMAGE_URL = "https://api.vedicastroapi.com/v3-json/horoscope/chart-image"
+
+# Дефолты как в тестере
+VEDIC_DEFAULT_DIV = "D1"  # натальная карта (основная)
+VEDIC_DEFAULT_STYLE = "south"  # стиль карты
+VEDIC_DEFAULT_COLOR = "#893693"  # фиолетовый как на скрине
+VEDIC_DEFAULT_LANG = "ru"
+
+DB_PATH = Path("bot.db")
 
 SUPPORT_MESSAGE: Final[str] = (
     "🛠 Чтобы мы быстрее помогли, напишите:\n"
@@ -129,6 +151,171 @@ SUIT_INFO: Dict[str, Dict[str, str]] = {
 }
 
 
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_user_exists(user_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+
+def get_user(user_id: int) -> Dict[str, Any]:
+    ensure_user_exists(user_id)
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return {}
+        return dict(row)
+
+
+def update_user_field(user_id: int, field: str, value: Any) -> None:
+    allowed_fields = {
+        "birth_date",
+        "birth_time",
+        "lat",
+        "lon",
+        "tz_offset_minutes",
+        "name",
+        "age",
+        "gender",
+    }
+    if field not in allowed_fields:
+        LOGGER.warning("Attempt to update unsupported field %s", field)
+        return
+
+    ensure_user_exists(user_id)
+    with get_db_connection() as conn:
+        conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+        conn.commit()
+
+
+def calc_timezone_offset_minutes(lat: float, lon: float) -> Optional[int]:
+    """
+    Приблизительное смещение часового пояса от UTC в минутах по долготе.
+    Без timezonefinder/pytz, без учета DST (летнего времени).
+    Округляем до ближайших 30 минут, чтобы 5:30 => 330 минут и т.п.
+    """
+    try:
+        # 15 градусов = 1 час
+        offset_hours = lon / 15.0
+        # округляем до 0.5 часа
+        offset_hours = round(offset_hours * 2) / 2
+        return int(offset_hours * 60)
+    except Exception:
+        return None
+
+
+def iso_date_to_ddmmyyyy(iso_date: str) -> str:
+    # iso_date: "YYYY-MM-DD" -> "DD/MM/YYYY"
+    dt = datetime.strptime(iso_date, "%Y-%m-%d")
+    return dt.strftime("%d/%m/%Y")
+
+
+def tz_minutes_to_decimal_hours(offset_minutes: int) -> str:
+    """
+    VedicAstroAPI chart-image нормально переваривает tz как десятичные часы:
+    330 минут -> "5.5", -360 -> "-6"
+    """
+    hours = offset_minutes / 60.0
+    # красивый вывод без лишних нулей
+    s = f"{hours:.4f}".rstrip("0").rstrip(".")
+    if s == "-0":
+        s = "0"
+    return s
+
+
+def extract_svg_from_response_text(text: str) -> Optional[str]:
+    """
+    На тестере иногда приходит JSON вида {"status":200,"response":"<?xml...<svg ..."}
+    Иногда приходит чистый SVG текстом.
+    Тут вытаскиваем SVG в обоих случаях.
+    """
+    raw = text.strip()
+
+    # Попробуем распарсить как JSON
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            candidate = data.get("response") or data.get("data")
+            if isinstance(candidate, str):
+                raw = candidate.strip()
+    except Exception:
+        pass
+
+    # SVG может начинаться с <?xml ...> или сразу с <svg ...>
+    if "<svg" in raw:
+        return raw
+    return None
+
+
+def vedicastro_get_chart_svg(
+    *,
+    dob_ddmmyyyy: str,
+    tob_hhmm: str,
+    lat: float,
+    lon: float,
+    tz_decimal_hours: str,
+    api_key: str,
+    div: str = VEDIC_DEFAULT_DIV,
+    style: str = VEDIC_DEFAULT_STYLE,
+    color: str = VEDIC_DEFAULT_COLOR,
+    lang: str = VEDIC_DEFAULT_LANG,
+    timeout_sec: int = 25,
+) -> str:
+    """
+    Делаем запрос к VedicAstroAPI Chart Image и возвращаем SVG строкой.
+    Если не получилось — кидаем Exception с понятным текстом.
+    """
+    if not api_key:
+        raise Exception("VEDICASTRO_API_KEY пустой. Добавь ключ в .env и перезапусти бота.")
+
+    params = {
+        "dob": dob_ddmmyyyy,
+        "tob": tob_hhmm,
+        "lat": str(lat),
+        "lon": str(lon),
+        "tz": tz_decimal_hours,
+        "div": div,
+        "style": style,
+        "color": color,
+        "lang": lang,
+        "api_key": api_key,
+    }
+
+    url = VEDIC_CHART_IMAGE_URL + "?" + urllib.parse.urlencode(params, safe=":/")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            body = resp.read()
+            # Иногда у них кодировка не utf-8, поэтому страхуемся
+            try:
+                text = body.decode("utf-8")
+            except Exception:
+                text = body.decode("latin-1", errors="replace")
+    except Exception as e:
+        raise Exception(f"Ошибка запроса к VedicAstroAPI: {e}")
+
+    svg = extract_svg_from_response_text(text)
+    if not svg:
+        # Покажем кусок ответа, чтобы было проще дебажить
+        snippet = text[:300].replace("\n", " ")
+        raise Exception(f"VedicAstroAPI вернул неожиданный ответ (не SVG). Пример: {snippet}")
+
+    return svg
+
+
 def _support_url() -> str:
     url = os.getenv("SUPPORT_CHAT_URL")
     if not url:
@@ -191,6 +378,18 @@ def build_tarot_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(text="⚖️ Да / Нет", callback_data="tarot:yesno")],
+            [InlineKeyboardButton(text=SUPPORT_BUTTON_TEXT, url=_support_url())],
+        ]
+    )
+
+
+def build_main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(text="⚖️ Да / Нет", callback_data="tarot:yesno"),
+                InlineKeyboardButton(text="🪐 Натальная карта", callback_data="natal_chart"),
+            ],
             [InlineKeyboardButton(text=SUPPORT_BUTTON_TEXT, url=_support_url())],
         ]
     )
@@ -701,6 +900,15 @@ async def personal_area_text_input(
     )
 
 
+async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "🏠 Главное меню\n\nВыбери действие:", reply_markup=build_main_menu_kb()
+    )
+
+
 async def send_tarot_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
@@ -711,7 +919,94 @@ async def send_tarot_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_tarot_menu(update, context)
+    await send_main_menu(update, context)
+
+
+async def on_natal_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.message is None or query.from_user is None:
+        return
+    await query.answer()
+
+    user = get_user(query.from_user.id)
+
+    birth_date = user.get("birth_date")
+    birth_time = user.get("birth_time")
+    lat = user.get("lat")
+    lon = user.get("lon")
+    tz_offset_minutes_raw = user.get("tz_offset_minutes")
+
+    if not birth_date or not birth_time or lat is None or lon is None:
+        await query.message.reply_text(
+            "🪐 Чтобы построить натальную карту, сначала заполни:\n"
+            "📅 дату и время рождения\n"
+            "📍 место рождения (координаты)\n\n"
+            "Зайди: 👤 Мой аккаунт → 📁 Данные → 📅 Данные рождения"
+        )
+        return
+
+    tz_offset_minutes: Optional[int]
+    try:
+        tz_offset_minutes = int(tz_offset_minutes_raw)
+    except Exception:
+        tz_offset_minutes = None
+
+    if tz_offset_minutes is None:
+        try:
+            approx = calc_timezone_offset_minutes(float(lat), float(lon))
+        except Exception:
+            approx = None
+
+        if approx is not None:
+            tz_offset_minutes = approx
+            update_user_field(query.from_user.id, "tz_offset_minutes", tz_offset_minutes)
+
+    if tz_offset_minutes is None:
+        await query.message.reply_text(
+            "⚠️ Не получилось определить часовой пояс (tz) даже приближённо.\n"
+            "Попробуй заново отправить место рождения (геолокацию)."
+        )
+        return
+
+    loading_msg = await query.message.reply_text("✨ Составляю натальную карту…")
+    await asyncio.sleep(2)
+
+    try:
+        dob = iso_date_to_ddmmyyyy(str(birth_date))
+        tz_decimal = tz_minutes_to_decimal_hours(int(tz_offset_minutes))
+
+        svg = vedicastro_get_chart_svg(
+            dob_ddmmyyyy=dob,
+            tob_hhmm=str(birth_time),
+            lat=float(lat),
+            lon=float(lon),
+            tz_decimal_hours=tz_decimal,
+            api_key=VEDICASTRO_API_KEY,
+            div=VEDIC_DEFAULT_DIV,
+            style=VEDIC_DEFAULT_STYLE,
+            color=VEDIC_DEFAULT_COLOR,
+            lang=VEDIC_DEFAULT_LANG,
+        )
+
+        svg_bytes = svg.encode("utf-8", errors="replace")
+        buffered_svg = BufferedInputFile(svg_bytes, filename="natal_chart.svg")
+        doc = InputFile(io.BytesIO(buffered_svg.data), filename=buffered_svg.filename)
+
+        await query.message.reply_document(
+            document=doc,
+            caption="🪐 Натальная карта готова (SVG-файл).",
+        )
+
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            await loading_msg.edit_text(f"❌ Не удалось построить натальную карту.\n\n{e}")
+        except Exception:
+            await query.message.reply_text(f"❌ Не удалось построить натальную карту.\n\n{e}")
 
 
 async def on_yesno_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -841,6 +1136,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("support", support))
     application.add_handler(CommandHandler("cab", show_personal_area))
+    application.add_handler(CallbackQueryHandler(on_natal_chart, pattern="^natal_chart$"))
     application.add_handler(
         CallbackQueryHandler(on_yesno_start, pattern="^tarot:yesno$")
     )
@@ -880,11 +1176,10 @@ def build_application(token: str) -> Application:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
+    if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is required")
 
-    build_application(token).run_polling()
+    build_application(TELEGRAM_BOT_TOKEN).run_polling()
 
 
 if __name__ == "__main__":
